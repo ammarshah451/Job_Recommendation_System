@@ -38,3 +38,7 @@ Thumbs.db
 # Large raw archives (not tracked)
 *.zip
 postings.csv.zip
+
+# Training logs
+training.log
+*.log
