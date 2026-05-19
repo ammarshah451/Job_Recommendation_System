@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { PixelCat } from "@/components/ui/pixel-cat";
 
 export const metadata: Metadata = {
   title: "NexusHire — Job search that explains itself",
@@ -17,7 +18,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           rel="stylesheet"
         />
       </head>
-      <body>{children}</body>
+      <body>
+        {children}
+        <PixelCat />
+      </body>
     </html>
   );
 }
