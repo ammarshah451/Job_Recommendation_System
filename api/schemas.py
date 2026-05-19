@@ -12,6 +12,8 @@ class JobSummary(BaseModel):
     skills: str | None = None
     salary_min: float | None = None
     salary_max: float | None = None
+    description: str | None = None
+    posted_days_ago: int | None = None
 
 
 class Recommendation(BaseModel):

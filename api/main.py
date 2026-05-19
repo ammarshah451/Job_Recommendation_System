@@ -9,7 +9,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from api.schemas import (
     JobSummary, Recommendation, RecommendationResponse, NewUserRequest,
@@ -99,33 +101,83 @@ class AppState:
 
 
 _STATE: AppState | None = None
+import threading
+_STATE_LOCK = threading.Lock()
 
 
 def get_state() -> AppState:
     global _STATE
-    if _STATE is None:
-        _STATE = AppState(load_settings())
-    _STATE.ensure_loaded()
+    with _STATE_LOCK:
+        if _STATE is None:
+            _STATE = AppState(load_settings())
+        _STATE.ensure_loaded()
     return _STATE
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield  # lazy load — avoid forcing heavy init at startup
+    # Warm-load on startup. Pays the ~15s cost once during boot instead of on
+    # the first request — also eliminates the race where a concurrent first
+    # request hit a half-initialized AppState and 500'd.
+    import logging
+    log = logging.getLogger("uvicorn.error")
+    log.info("Warming up recommendation pipeline...")
+    try:
+        get_state()
+        log.info("Pipeline warm — ready to serve requests")
+    except Exception as e:
+        log.error(f"Pipeline warm-up failed: {e}")
+    yield
 
 
 app = FastAPI(title="Hybrid Job Recommender", version="1.0", lifespan=lifespan)
 
+_ALLOWED_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_with_cors(request: Request, exc: HTTPException):
+    """FastAPI's default exception handler skips CORSMiddleware, so a 4xx from any
+    endpoint surfaces in the browser as a CORS error rather than the actual status.
+    Re-attach the CORS headers manually so the frontend can read the real error."""
+    origin = request.headers.get("origin")
+    headers = {}
+    if origin in _ALLOWED_ORIGINS:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Vary"] = "Origin"
+    return JSONResponse(
+        {"detail": exc.detail}, status_code=exc.status_code, headers=headers
+    )
+
+
+def _str(val) -> str | None:
+    """Convert a value to string, returning None for NaN/empty/null."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    s = str(val).strip()
+    return s if s and s.lower() != "nan" else None
 
 def _job_summary(row: pd.Series) -> JobSummary:
     return JobSummary(
-        job_id=int(row["job_id"]), title=str(row.get("title", "")),
-        category=str(row.get("category", "")) or None,
-        seniority=str(row.get("seniority", "")) or None,
-        location=str(row.get("location", "")) or None,
-        skills=str(row.get("skills", "")) or None,
-        salary_min=float(row.get("salary_min") or 0) or None,
-        salary_max=float(row.get("salary_max") or 0) or None,
+        job_id=int(row["job_id"]),
+        title=_str(row.get("title")) or "",
+        category=_str(row.get("category")),
+        seniority=_str(row.get("seniority")),
+        location=_str(row.get("location")),
+        skills=_str(row.get("skills")),
+        salary_min=float(row["salary_min"]) if pd.notna(row.get("salary_min")) else None,
+        salary_max=float(row["salary_max"]) if pd.notna(row.get("salary_max")) else None,
+        description=_str(row.get("description")),
+        posted_days_ago=int(row["posted_days_ago"]) if pd.notna(row.get("posted_days_ago")) else None,
     )
 
 
@@ -163,6 +215,50 @@ def recommend_new_user(req: NewUserRequest):
         recommendations=[Recommendation(job_id=j, score=sc) for j, sc in recs],
         model="hybrid_cold_start",
     )
+
+
+@app.get("/jobs/batch", response_model=list[JobSummary])
+def jobs_batch(ids: str):
+    """Return job summaries for a comma-separated list of job_ids."""
+    s = get_state()
+    id_list = [int(x) for x in ids.split(",") if x.strip()]
+    existing = [i for i in id_list if i in s.data.jobs["job_id"].values]
+    if not existing:
+        return []
+    rows = s.data.jobs.set_index("job_id").loc[existing].reset_index()
+    return [_job_summary(r) for _, r in rows.iterrows()]
+
+
+@app.get("/users/{user_id}/skills", response_model=dict)
+def user_skills(user_id: int):
+    """Return the union of skills attributed to a user.
+
+    Source order: (1) the user's row in the canonical users table, if present;
+    (2) skills aggregated from the jobs they interacted with in train history.
+    Used by the frontend skill-fit feature before Supabase Auth + uploaded resumes
+    are in place."""
+    s = get_state()
+
+    # 1. Direct skills column
+    row = s.data.users.loc[s.data.users["user_id"] == user_id]
+    if not row.empty:
+        raw = _str(row.iloc[0].get("skills"))
+        if raw:
+            skills = sorted({k.strip().lower() for k in raw.split(",") if k.strip()})
+            if skills:
+                return {"skills": skills, "source": "profile"}
+
+    # 2. Fall back to history-union
+    seen_jobs = s.data.train.loc[s.data.train["user_id"] == user_id, "job_id"].unique()
+    if len(seen_jobs) == 0:
+        return {"skills": [], "source": "empty"}
+    rows = s.data.jobs.loc[s.data.jobs["job_id"].isin(seen_jobs), "skills"]
+    bag: set[str] = set()
+    for raw in rows:
+        clean = _str(raw)
+        if clean:
+            bag.update(k.strip().lower() for k in clean.split(",") if k.strip())
+    return {"skills": sorted(bag), "source": "history"}
 
 
 @app.get("/similar-jobs/{job_id}", response_model=list[JobSummary])

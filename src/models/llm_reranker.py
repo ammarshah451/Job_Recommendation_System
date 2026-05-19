@@ -1,12 +1,8 @@
-"""Groq-powered LLM reranker over the top-K candidates from LTR.
+"""LLM reranker over the top-K candidates from LTR.
 
-Rotates across up to three Groq API keys (GROQ_API_KEY, GROQ_API_KEY_2,
-GROQ_API_KEY_3): on rate-limit / quota errors the next key is tried before
-falling back to a pass-through that preserves the prior LTR scores. Returns
-(job_id, llm_score, explanation) tuples.
-
-The Groq endpoint is OpenAI-API-compatible, so we reuse the `openai` client
-with `base_url=https://api.groq.com/openai/v1`.
+Prefers Azure OpenAI when AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT are set.
+Falls back to Groq (rotating across GROQ_API_KEY / _2 / _3) otherwise.
+Returns (job_id, llm_score, explanation) tuples.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -20,7 +16,25 @@ log = get_logger(__name__)
 
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-DEFAULT_MODEL = "llama-3.1-8b-instant"   # fast, free-tier-friendly Groq model
+DEFAULT_MODEL = "llama-3.1-8b-instant"
+
+
+def _build_azure_client():
+    """Return an AzureOpenAI client if env vars are configured, else None."""
+    key = os.environ.get("AZURE_OPENAI_API_KEY", "").strip()
+    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
+    version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01").strip()
+    if not key or not endpoint:
+        return None, None
+    try:
+        from openai import AzureOpenAI
+        client = AzureOpenAI(api_key=key, azure_endpoint=endpoint, api_version=version)
+        deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini").strip()
+        log.info("LLMReranker: using Azure OpenAI (%s)", deployment)
+        return client, deployment
+    except Exception as e:
+        log.warning("Azure OpenAI client init failed: %s", e)
+        return None, None
 
 SYSTEM_PROMPT = (
     "You are an expert career advisor helping match job seekers to job postings. "
@@ -138,23 +152,35 @@ class LLMReranker:
     def __init__(self, cfg: LLMConfig | None = None, api_keys: list[str] | None = None,
                  client: Any = None):
         self.cfg = cfg or LLMConfig()
+        self._azure_deployment: str | None = None
         if client is not None:
             # Test/injection path: bypass rotation entirely.
             self._rotator = None
             self._injected_client = client
         else:
-            self._rotator = _GroqKeyRotator(api_keys if api_keys is not None
-                                            else _collect_groq_keys())
-            self._injected_client = None
-            if self._rotator.has_keys():
-                log.info("LLMReranker (Groq) ready with %d key(s)", len(self._rotator.keys))
+            # Prefer Azure OpenAI over Groq when credentials are present.
+            azure_client, azure_deployment = _build_azure_client()
+            if azure_client is not None:
+                self._rotator = None
+                self._injected_client = azure_client
+                self._azure_deployment = azure_deployment
             else:
-                log.info("LLMReranker: no GROQ_API_KEY* configured; will pass-through")
+                self._rotator = _GroqKeyRotator(api_keys if api_keys is not None
+                                                else _collect_groq_keys())
+                self._injected_client = None
+                if self._rotator.has_keys():
+                    log.info("LLMReranker (Groq) ready with %d key(s)", len(self._rotator.keys))
+                else:
+                    log.info("LLMReranker: no LLM credentials configured; will pass-through")
 
     def _client(self):
         if self._injected_client is not None:
             return self._injected_client
         return self._rotator.current() if self._rotator else None
+
+    def _model(self) -> str:
+        """Return the model/deployment name to use in API calls."""
+        return self._azure_deployment or self.cfg.model
 
     def _try_with_rotation(self, call):
         """Run `call(client)` with key rotation on rate-limit / auth errors.
@@ -198,7 +224,7 @@ class LLMReranker:
 
         def _call(client):
             return client.chat.completions.create(
-                model=self.cfg.model, max_tokens=self.cfg.max_tokens,
+                model=self._model(), max_tokens=self.cfg.max_tokens,
                 messages=[{"role": "system", "content": SYSTEM_PROMPT},
                           {"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
@@ -242,7 +268,7 @@ class LLMReranker:
 
         def _call(client):
             return client.chat.completions.create(
-                model=self.cfg.model, max_tokens=512,
+                model=self._model(), max_tokens=512,
                 messages=[{"role": "system", "content": "You are an expert career advisor."},
                           {"role": "user", "content": prompt}],
             )
